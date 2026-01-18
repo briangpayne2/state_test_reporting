@@ -1,12 +1,3 @@
-# Purpose:
-# Pull Bug work items from Azure DevOps (ADO) using WIQL (SQL-like query language),
-# then compute daily open-bug counts (burndown) and generate a trend chart.
-#
-# Data QA angle:
-# 1) Query + filter artifact data (ADO work items) using WIQL similar to SQL SELECT/FROM/WHERE.
-# 2) Validate and normalize timestamps (UTC) and report results in a business timezone (EST).
-# 3) Derive metrics (open bugs by day) using deterministic rules for CreatedDate/ClosedDate.
-
 import os
 import sys
 from dotenv import dotenv_values
@@ -25,8 +16,8 @@ env_path = ".env"
 config = dotenv_values(env_path)
 
 # Print diagnostics
-# Load runtime configuration (org/project/token + filter criteria).
-# NOTE: Never print secrets (ADO_PAT) in production logs.
+# NOTE (security): avoid printing secrets like ADO_PAT in real logs.
+# Data QA angle: configuration-driven filters make the report reproducible across teams/sprints.
 print("Loaded .env values:")
 for k in config:
     print(f"  {k}: {config[k]}")
@@ -47,17 +38,21 @@ iteration_path = config["ITERATION_PATH"]
 start_date = datetime.fromisoformat(config["START_DATE"])
 end_date = datetime.fromisoformat(config["END_DATE"])
 
-# WIQL (Work Item Query Language) is ADO's SQL-like query language for work items.
+# ----------------------------
+# WIQL (ADO "SQL" for work items)
+# ----------------------------
+# WIQL = Work Item Query Language. It's Azure DevOps' SQL-like query language for work items.
 # Conceptually:
 #   SELECT <fields>
 #   FROM workitems
 #   WHERE <filters>
+# We use WIQL to return a lightweight list of work item IDs, then pull full details in batches.
 
 # Step 1: Run WIQL to get matching work item IDs only (fast and lightweight).
 # Step 2: Use WorkItemsBatch to pull full field details in batches (API limits).
 wiql_query = {
     "query": f"""
-    -- Project fields we want back (projection), similar to SQL SELECT columns
+    -- Projection: choose the fields we need (similar to SQL SELECT columns)
     SELECT
         [System.Id],
         [System.WorkItemType],
@@ -69,13 +64,15 @@ wiql_query = {
         [System.CreatedDate]
     FROM workitems
     WHERE
-        -- Restrict to a single Team Project (like filtering by schema/tenant)
+        -- Scope to one Team Project (tenant-like filter)
         [System.TeamProject] = '{project}'
         AND (
+            -- Only bugs within the requested AreaPath + IterationPath
             [System.WorkItemType] = 'Bug'
             AND [System.AreaPath] = '{area_path}'
             AND [System.IterationPath] = '{iteration_path}'
             AND (
+                -- Time window filter (CreatedDate within START_DATE..END_DATE)
                 [System.CreatedDate] >= '{start_date.isoformat()}'
                 AND [System.CreatedDate] <= '{end_date.isoformat()}'
             )
@@ -104,8 +101,10 @@ if response.status_code != 200:
 work_item_ids = [item["id"] for item in response.json().get("workItems", [])]
 print(f"\n Retrieved {len(work_item_ids)} work item IDs")
 
-# WorkItemsBatch endpoint: fetches multiple work items in one request.
-# We request only the fields we need to compute burndown metrics and tag categories.
+# Hydrate work item details
+# WIQL returns only matching IDs. We then call the WorkItemsBatch endpoint to fetch fields
+# for many work items at once (similar to fetching rows by primary key in batches).
+# Batching reduces API calls and helps stay within payload/limit constraints.
 def fetch_work_items(ids):
     url = f"https://dev.azure.com/{organization}/_apis/wit/workitemsbatch?api-version=6.0"
     body = {
@@ -118,6 +117,7 @@ def fetch_work_items(ids):
     return requests.post(url, headers=headers, json=body).json()
 
 data = []
+# Pull work items in chunks to avoid overly large request bodies
 for i in range(0, len(work_item_ids), 200):
     batch = work_item_ids[i:i+200]
     result = fetch_work_items(batch)
@@ -137,10 +137,14 @@ if df.empty:
     print("No bugs found for the given date range and filters.")
     sys.exit(0)
 
+# Normalize timestamps
+# ADO returns ISO 8601 strings. We parse them as UTC to avoid timezone drift in comparisons.
+# Later we convert boundaries to EST for "business day" reporting.
 df["CreatedDate"] = pd.to_datetime(df["CreatedDate"], format='mixed', errors='coerce', utc=True)
 df["ClosedDate"] = pd.to_datetime(df["ClosedDate"], format='mixed', errors='coerce', utc=True)
 
-# Tag categories
+# Tag categories (simple classification)
+# Data QA angle: categorizing work items lets you segment quality trends (e.g., exploratory vs system defects).
 df["Exploratory"] = df["Tags"].fillna("").str.lower().str.contains("exploratory")
 df["TestCase"] = df["Tags"].fillna("").str.lower().str.contains("test case update")
 df["PEGA"] = df["Tags"].fillna("").str.lower().str.contains("pega")
@@ -164,6 +168,11 @@ date_index_local = pd.date_range(start_local, end_local, freq="D", tz=EST)
 
 # 2) Accumulate counts; plot with pure date objects (no time, no tz)
 burndown_all, burndown_exploratory, burndown_nonexploratory, burndown_testcase, burndown_pega = [], [], [], [], []
+
+# Burndown rule (deterministic):
+# A bug is "open" on a given day boundary if:
+#   CreatedDate <= boundary AND (ClosedDate is null OR ClosedDate > boundary)
+# This is the same idea as point-in-time reconciliation in data QA.
 
 for dt_local in date_index_local:
     boundary_utc = dt_local.tz_convert("UTC")   # compare in UTC (df is UTC)
